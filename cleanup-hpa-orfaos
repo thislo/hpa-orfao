@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cleanup-hpa-orfaos
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cleanup-hpa-sa
+  namespace: cleanup-hpa-orfaos
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cleanup-hpa-role
+rules:
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get","list","delete","watch"]
+  - apiGroups: ["apps.openshift.io"]
+    resources: ["deploymentconfigs"]
+    verbs: ["get","list","watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cleanup-hpa-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cleanup-hpa-role
+subjects:
+  - kind: ServiceAccount
+    name: cleanup-hpa-sa
+    namespace: cleanup-hpa-orfaos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cleanup-hpa-script
+  namespace: cleanup-hpa-orfaos
+data:
+  cleanup-hpa.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    echo "[INFO] Limpando HPAs órfãos em todos os namespaces..."
+
+    # Lista HPAs de DeploymentConfig, com namespace, nome do HPA e nome do DC
+    mapfile -t LINES < <(oc get hpa -A -o jsonpath='{range .items[?(@.spec.scaleTargetRef.kind=="DeploymentConfig")]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.spec.scaleTargetRef.name}{"\n"}{end}' || true)
+
+    CLEANED=0
+
+    for line in "${LINES[@]}"; do
+      ns="${line%%|*}"
+      rest="${line#*|}"
+      hpa="${rest%%|*}"
+      dc="${rest#*|}"
+
+      # ignora namespaces de sistema
+      if [[ "$ns" == default || "$ns" == openshift* || "$ns" == kube* ]]; then
+        continue
+      fi
+
+      # se o DC não existir, apaga o HPA
+      if ! oc -n "$ns" get dc "$dc" >/dev/null 2>&1; then
+        echo "[CLEANUP] Deletando HPA órfão '$hpa' em '$ns' (apontava para DC '$dc')"
+        oc -n "$ns" delete hpa "$hpa" --ignore-not-found
+        CLEANED=$((CLEANED+1))
+      fi
+    done
+
+    if [[ $CLEANED -eq 0 ]]; then
+      echo "[INFO] Nenhum HPA órfão encontrado para limpar."
+    else
+      echo "[INFO] Concluído. Total de HPAs órfãos limpos: $CLEANED"
+    fi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cleanup-hpa-orfaos
+  namespace: cleanup-hpa-orfaos
+spec:
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: cleanup-hpa-sa
+          restartPolicy: Never
+          containers:
+            - name: cleanup
+              image: quay.io/openshift/origin-cli:4.16
+              command: ["/bin/bash","/scripts/cleanup-hpa.sh"]
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+          volumes:
+            - name: script
+              configMap:
+                name: cleanup-hpa-script
+                defaultMode: 0755
